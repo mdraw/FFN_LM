@@ -10,7 +10,7 @@ import itertools
 from torch.autograd import Variable
 import cv2
 
-
+# 40 40 40    30   30  30   5 5 5
 class BatchCreator(data.Dataset):
     def __init__(
             self,
