@@ -46,13 +46,13 @@ if not os.path.exists(args.save_path):
 
 
 def run():
-    """创建模型"""
+    """construct model"""
     model = FFN(in_channels=2, out_channels=1).cuda()
 
-    """数据路径"""
+    """data path"""
     input_h5data = [args.data]
 
-    """创建data loader"""
+    """construct data loader"""
     train_dataset = BatchCreator(input_h5data, args.input_size, delta=args.delta, train=True)
     train_loader = DataLoader(train_dataset, shuffle=True, num_workers=1, pin_memory=True)
 
@@ -65,7 +65,7 @@ def run():
 
     best_loss = np.inf
 
-    """获取数据流"""
+    """obtain the train/label  data stream"""
     for itr, (seeds, images, labels, offsets) in enumerate(
             get_batch(train_loader, args.batch_size, args.input_size, partial(fixed_offsets, fov_moves=train_dataset.shifts))):
 
@@ -81,7 +81,7 @@ def run():
         optimizer.zero_grad()
         loss = F.binary_cross_entropy_with_logits(updated, labels)
         loss.backward()
-        """梯度截断"""
+        """gradient control"""
         torch.nn.utils.clip_grad_norm(model.parameters(), args.clip_grad_thr)
 
         optimizer.step()
@@ -92,7 +92,7 @@ def run():
 
         # update_seed(updated, seeds, model, offsets)
         # seed = updated
-        """根据最佳loss并且保存模型"""
+        """save best model"""
         if best_loss > loss.item():
             best_loss = loss.item()
             torch.save(model.state_dict(), os.path.join(args.save_path, 'ffn.pth'))
