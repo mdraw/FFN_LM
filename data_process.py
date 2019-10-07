@@ -6,8 +6,8 @@ from libtiff import TIFFfile
 import cv2
 
 parser = argparse.ArgumentParser('script to generate training data')
-parser.add_argument('--image', type=str, default='./data/ffn/images/raw_data_4_channel.tif', help='directory of images')
-parser.add_argument('--label', type=str, default='./data/ffn/labels/target_data.tif', help='directory of labels')
+parser.add_argument('--image', type=str, default='raw_data_4_channel.tif', help='directory of images')
+parser.add_argument('--label', type=str, default='target_data.tif', help='directory of labels')
 parser.add_argument('--save', type=str, default='data1.h5', help='save file name')
 parser.add_argument('--shape', type=list, default=[40, 40, 40], help='seed shape')
 parser.add_argument('--thr', type=list, default=[0.025, 0.05, 0.075, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9])
