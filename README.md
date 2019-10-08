@@ -1,3 +1,3 @@
 # Usage
-`tool/data_script.py`: 生成训练h5文件
-`train_neurodata.py`: 训练
+`tool/data_script.py`: generate h5 file
+`train_neurodata.py`:run
