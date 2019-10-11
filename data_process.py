@@ -2,27 +2,32 @@ import argparse
 from collections import defaultdict
 import h5py
 import numpy as np
-from libtiff import TIFFfile
+import tifffile
 import cv2
 
 parser = argparse.ArgumentParser('script to generate training data')
-parser.add_argument('--image', type=str, default='raw_data_4_channel.tif', help='directory of images')
-parser.add_argument('--label', type=str, default='target_data.tif', help='directory of labels')
+
+parser.add_argument('--image', type=str, default='train_raw_2.tif', help='image data path')
+parser.add_argument('--label', type=str, default='target_data_raw2_label.tif', help='label data path')
+
 parser.add_argument('--save', type=str, default='data1.h5', help='save file name')
-parser.add_argument('--shape', type=list, default=[40, 40, 40], help='seed shape')
+parser.add_argument('--shape', type=list, default=[41, 41, 41], help='seed shape')
 parser.add_argument('--thr', type=list, default=[0.025, 0.05, 0.075, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9])
-parser.add_argument('--min_size', type=int, default=5000)
+parser.add_argument('--min_size', type=int, default=100)
 
 args = parser.parse_args()
 
 
 def _query_summed_volume(svt, diam):
     """Queries a summed volume table.
+
     Operates in 'VALID' mode, i.e. only computes the sums for voxels where the
     full diam // 2 context is available.
+
     Args:
     svt: summed volume table (see _summed_volume_table)
     diam: diameter (z, y, x tuple) of the area within which to compute sums
+
     Returns:
     sum of all values within a diam // 2 radius (under L1 metric) of every voxel
     in the array from which 'svt' was built.
@@ -44,10 +49,13 @@ def _summed_volume_table(val):
 
 def clear_dust(data, min_size=10):
     """Removes small objects from a segmentation array.
+
     Replaces objects smaller than `min_size` with 0 (background).
+
     Args:
     data: numpy array of segment IDs
     min_size: minimum size in voxels of an object to be retained
+
     Returns:
     the data array (modified in place)
     """
@@ -103,20 +111,29 @@ def compute_partitions(seg_array, thresholds, lom_radius, min_size=10000):
     return corner, output
 
 
-def run():
-    images = TIFFfile(args.image)
-    labels = TIFFfile(args.label)
-    samples, _ = images.get_samples()
-    images = np.array(samples).transpose([1, 2, 3, 0])
-    images = np.array([cv2.cvtColor(im, cv2.COLOR_BGR2GRAY) for im in images])
-    samples, _ = labels.get_samples()
-    labels = np.array(samples).transpose([1, 2, 3, 0])
-    labels = np.array([cv2.cvtColor(label, cv2.COLOR_BGR2GRAY) for label in labels])
 
+def run():
+    images = tifffile.TiffFile(args.image).asarray()
+    labels = tifffile.TiffFile(args.label).asarray()
+    images = np.array([cv2.cvtColor(im, cv2.COLOR_BGR2GRAY) for im in images])
+    #labels = np.array([cv2.cvtColor(label, cv2.COLOR_BGR2GRAY) for label in labels])
+
+
+    #pad1 = np.zeros([175, 400, 400])
+
+    #temp1 = np.concatenate((pad1, images), axis=0)
+    #images = np.concatenate((temp1, pad1), axis=0)
+
+
+    #temp2 = np.concatenate((pad1, labels), axis=0)
+    #labels = np.concatenate((temp2, pad1), axis=0)
+
+    print(labels.shape)
+    print(images.shape)
     m = np.array([int(x/2) for x in args.shape])
     seg = labels.copy()
     corner, partitions = compute_partitions(seg[...], [float(x) for x in args.thr], m, args.min_size)
-    print(corner)
+
     totals = defaultdict(int)  # partition -> voxel count
     indices = defaultdict(list)  # partition -> [(vol_id, 1d index)]
     vol_shapes = partitions.shape
@@ -132,6 +149,7 @@ def run():
     indices = np.concatenate([np.resize(np.random.permutation(v), max_count) for v in indices.values()], axis=0)
     np.random.shuffle(indices)
     coor = []
+    print(len(indices))
     for coord_idx in indices:
         z, y, x = np.unravel_index(coord_idx, vol_shapes)
         coor.append([z+m[2], y+m[1], x+m[0]])
