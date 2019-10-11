@@ -9,7 +9,6 @@ floatX = np.float32  # TODO: Either hardcode float32 everywhere or add float16 s
 
 def select_mpl_backend(mpl_backend):
     """ Set up matplotlib to use the specified backend.
-
     This needs to be run BEFORE the first import of matplotlib.pyplot!
     """
     import os
