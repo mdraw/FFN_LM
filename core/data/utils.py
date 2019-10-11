@@ -26,7 +26,7 @@ HaltInfo = namedtuple('HaltInfo', ['is_halt', 'extra_fetches'])
 
 
 def make_seed(shape, pad=0.05, seed=0.95):
-    """创建种子"""
+    
     seed_array = np.full(list(shape), pad, dtype=np.float32)
     idx = tuple([slice(None)] + list(np.array(shape) // 2))
     seed_array[idx] = seed
@@ -34,7 +34,7 @@ def make_seed(shape, pad=0.05, seed=0.95):
 
 
 def fixed_offsets(seed, fov_moves, threshold=0.9):
-    """offset偏移."""
+    """offset_coord_sequence."""
     for off in itertools.chain([(0, 0, 0)], fov_moves):
         is_valid_move = seed[0,
                             seed.shape[1] // 2 + off[2],
@@ -49,7 +49,7 @@ def fixed_offsets(seed, fov_moves, threshold=0.9):
 
 
 def center_crop_and_pad(data, coor, target_shape):
-    """根据中心坐标 crop patch"""
+    """use center coord to crop patch"""
     target_shape = np.array(target_shape)
 
     start = coor - target_shape // 2
@@ -75,7 +75,7 @@ def center_crop_and_pad(data, coor, target_shape):
 
 
 def crop_and_pad(data, offset, crop_shape, target_shape=None):
-    """根据offset crop patch"""
+    """use offset to crop patch"""
     # Spatial dimensions only. All vars in zyx.
     shape = np.array(data.shape[1:])
     crop_shape = np.array(crop_shape)
