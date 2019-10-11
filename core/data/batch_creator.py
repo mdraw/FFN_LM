@@ -1,16 +1,10 @@
 from torch.utils import data
-from typing import Tuple, Dict, Optional, Union, Sequence, Any, List, Callable
-import logging
-import numpy as np
-import torch
-from scipy.special import logit
+from typing import Sequence, List
+import h5py
 from .utils import *
 import random
-import itertools
-from torch.autograd import Variable
-import cv2
 
-# 40 40 40    30   30  30   5 5 5
+
 class BatchCreator(data.Dataset):
     def __init__(
             self,
@@ -40,8 +34,6 @@ class BatchCreator(data.Dataset):
         # Early checks
         if len(self.input_data) != len(self.label_data):
             raise ValueError("input_h5data and target_h5data must be lists of same length!")
-        if not train:
-            logger.warning('Augmentations should not be used on validation data.')
 
         self.input_size = np.array(input_size)
         self.seed_shape = self.input_size + np.array(delta) * 2
@@ -60,27 +52,26 @@ class BatchCreator(data.Dataset):
         self.reset = True
 
     def parse_h5py(self, input):
+        
         for input_data in input:
             with h5py.File(input_data, 'r') as raw:
-                self.input_data.append(raw['image'].value)
+                self.input_data.append((raw['image'].value.astype(np.float32)-128) / 33.0)
                 self.label_data.append(raw['label'].value)
                 self.coor.append(raw['coor'].value)
                 self.seed.append(logit(np.full(list(raw['image'].value.shape), 0.05, dtype=np.float32)))
 
     def __getitem__(self, idx):
+        
+        """use label coordinate to extract patch from the data"""
         self.coor_patch = self.coor[self.data_idx][idx]
 
-        start = self.coor_patch - self.seed_shape // 2
-        end = start + self.seed_shape
-
-        assert np.all(start >= 0)
-
-        selector = [slice(s, e) for s, e in zip(start, end)]
-        self.image_patch = self.input_data[self.data_idx][selector]
-        self.label_patch = self.label_data[self.data_idx][selector]
+        self.image_patch = center_crop_and_pad(self.input_data[self.data_idx], self.coor_patch, self.seed_shape)
+        self.label_patch = center_crop_and_pad(self.label_data[self.data_idx], self.coor_patch, self.seed_shape)
+        """ensure the center have the right label"""
         self.label_patch = np.logical_and(self.label_patch > 0, np.equal(self.label_patch, self.label_patch[tuple(self.label_radii)]))
         self.label_patch = np.where(self.label_patch, np.ones(self.label_patch.shape)*0.95, np.ones(self.label_patch.shape)*0.05)
-        self.seed_patch = self.seed[self.data_idx][selector]
+
+        self.seed_patch = center_crop_and_pad(self.seed[self.data_idx], self.coor_patch, self.seed_shape)
         self.seed_patch[tuple(self.label_radii)] = logit(0.95)
 
         return torch.from_numpy(self.image_patch).float(), \
