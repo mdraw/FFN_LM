@@ -1,360 +1,40 @@
-# ELEKTRONN3 - Neural Network Toolkit
-#
-# Copyright (c) 2017 - now
-# Max Planck Institute of Neurobiology, Munich, Germany
-# Authors: Martin Drawitsch, Philipp Schubert, Marius Killinger
-
-
-import logging
-import os
-import signal
-import traceback
-from typing import Sequence, Tuple, Union
 import itertools
+import sys
+from scipy.special import expit
 from scipy.special import logit
 import torch
-
-import h5py
+import six
 import numpy as np
-
-from core import floatX
-
-logger = logging.getLogger("elektronn3log")
-
-
-eps = 0.0001  # To avoid divisions by zero
-
-
-def _to_full_numpy(seq) -> np.ndarray:
-    if isinstance(seq, np.ndarray):
-        return seq
-    elif isinstance(seq[0], np.ndarray):
-        return np.array(seq)
-    elif isinstance(seq[0], h5py.Dataset):
-        # Explicitly pre-load all dataset values into ndarray format
-        return np.array([x.value for x in seq])
-    else:
-        raise ValueError('inputs must be an ndarray, a sequence of ndarrays '
-                         'or a sequence of h5py.Datasets.')
+from scipy import ndimage
+import skimage
+import skimage.feature
+import logging
+import weakref
+from collections import namedtuple
+from collections import deque
+import time
+from torch.autograd import Variable
 
 
-def calculate_means(inputs: Sequence) -> Tuple[float]:
-    inputs = [
-        _to_full_numpy(inp).reshape(inp.shape[0], -1)  # Flatten every dim except C
-        for inp in inputs
-    ]  # Necessary if shapes don't match
-    # Preserve C, but concatenate everything else into one flat dimension
-    inputs = np.concatenate(inputs, axis=1)
-    means = np.mean(inputs, axis=1)
-    return tuple(means)
+MAX_SELF_CONSISTENT_ITERS = 32
+HALT_SILENT = 0
+PRINT_HALTS = 1
+HALT_VERBOSE = 2
+
+OriginInfo = namedtuple('OriginInfo', ['start_zyx', 'iters', 'walltime_sec'])
+HaltInfo = namedtuple('HaltInfo', ['is_halt', 'extra_fetches'])
 
 
-def calculate_stds(inputs: Sequence) -> Tuple[float]:
-    inputs = [
-        _to_full_numpy(inp).reshape(inp.shape[0], -1)  # Flatten every dim except C
-        for inp in inputs
-    ]  # Necessary if shapes don't match
-    # Preserve C, but concatenate everything else into one flat dimension
-    inputs = np.concatenate(inputs, axis=1)
-    stds = np.std(inputs, axis=1)
-    return tuple(stds)
-
-
-def calculate_class_weights(
-        targets: Sequence[np.ndarray],
-        mode='inverse'
-) -> np.ndarray:
-    """Calulate class weights that assign more weight to less common classes.
-
-    The weights can then be used for loss function rebalancing (e.g. for
-    CrossEntropyLoss it's very important to do this when training on
-    datasets with high class imbalance."""
-
-    targets = np.concatenate([
-        _to_full_numpy(target).flatten()  # Flatten every dim except C
-        for target in targets
-    ])  # Necessary if shapes don't match
-
-    def __inverse(targets):
-        """The weight of each class c1, c2, c3, ... with labeled-element
-        counts n1, n2, n3, ... is assigned by weight[i] = N / n[i],
-        where N is the total number of all elements in all ``targets``.
-        (We could achieve the same relative weight proportions by
-        using weight[i] = 1 / n[i], as proposed in
-        https://arxiv.org/abs/1707.03237, but we multiply by N to prevent
-        very small values that could lead to numerical issues."""
-        classes = np.unique(targets)
-        # Count total number of labeled elements per class
-        num_labeled = np.array([
-            np.sum(np.equal(targets, c))
-            for c in classes
-        ], dtype=np.float32)
-        class_weights = (targets.size / num_labeled + eps).astype(np.float32)
-        return class_weights
-
-    def __binmean(targets):
-        """Use the mean of the targets to determine class weights.
-
-        This assumes a binary segmentation problem (background/foreground) and
-        breaks in a multi-class setting."""
-        target_mean = np.mean(targets)
-        bg_weight = target_mean / (1. + target_mean)
-        fg_weight = 1. - bg_weight
-        # class_weights = torch.tensor([bg_weight, fg_weight])
-        class_weights = np.array([bg_weight, fg_weight], dtype=np.float32)
-        return class_weights
-
-    if mode == 'inverse':
-        return __inverse(targets)
-    elif mode == 'inversesquared':
-        return __inverse(targets) ** 2
-    elif mode == 'binmean':
-        return __binmean(targets)
-
-
-def calculate_nd_slice(src, coords_lo, coords_hi):
-    """Calculate the ``slice`` object list that is used as indices for
-    reading from a data source.
-
-    Unfortunately, this kind of slice list is not yet supported by h5py.
-    It only works with numpy arrays."""
-    # Separate spatial dimensions (..., H, W) from nonspatial dimensions (C, ...)
-    spatial_dims = len(coords_lo)  # Assuming coords_lo addresses all spatial dims
-    nonspatial_dims = src.ndim - spatial_dims  # Assuming every other dim is nonspatial
-
-    # Calculate necessary slice indices for reading the file
-    nonspatial_slice = [  # Slicing all available content in these dims.
-        slice(0, src.shape[i]) for i in range(nonspatial_dims)
-    ]
-    spatial_slice = [  # Slice only the content within the coordinate bounds
-        slice(coords_lo[i], coords_hi[i]) for i in range(spatial_dims)
-    ]
-    full_slice = nonspatial_slice + spatial_slice
-    return full_slice
-
-
-def slice_h5(
-        src: Union[h5py.Dataset, np.ndarray],
-        coords_lo: Sequence[int],
-        coords_hi: Sequence[int],
-        dtype: type = np.float32,
-        prepend_empty_axis: bool = False,
-        max_retries: int = 5,
-        check_bounds=True,
-) -> np.ndarray:
-    """ Slice a patch of 3D image data out of a h5py dataset.
-
-    Args:
-        src: Source data set from which to read data.
-            The expected data shapes are (C, D, H, W) or (D, H, W).
-        coords_lo: Lower bound of the coordinates where data should be read
-            from in ``src``.
-        coords_hi: Upper bound of the coordinates where data should be read
-            from in ``src``.
-        dtype: NumPy ``dtype`` that the sliced array will be cast to if it
-            doesn't already have this dtype.
-        prepend_empty_axis: Prepends a new empty (1-sized) axis to the sliced
-            array before returning it.
-        max_retries: Maximum retries if a read error occurs when reading from
-            the HDF5 file.
-        check_bounds: If ``True`` (default), only indices that are within the
-            bounds of ``src`` will be allowed (no negative indices or slices
-            to indices that exceed the shape of ``src``, which would normally
-            just be ignored).
-
-    Returns:
-        Sliced image array.
-    """
-    if check_bounds:
-        if np.any(np.array(coords_lo) < 0):
-            raise RuntimeError(f'coords_lo={coords_lo} exceeds src shape {src.shape[-3:]}')
-        if np.any(np.array(coords_hi) > np.array(src.shape[-3:])):
-            raise RuntimeError(f'coords_hi={coords_hi} exceeds src shape {src.shape[-3:]}')
-    if max_retries <= 0:
-        logger.error(
-            f'slice_h5(): max_retries exceeded at {coords_lo}, {coords_hi}. Aborting...'
-        )
-        raise ValueError
-
-    try:
-        # Generalized n-d slicing code (temporarily disabled because of the
-        #  performance issue described in the comment below):
-        ## full_slice = calculate_nd_slice(src, coords_lo, coords_hi)
-        ## # # TODO: Use a better workaround or fix this in h5py:
-        ## srcv = src.value  # Workaround for hp5y indexing limitation. The `.value` call is very unfortunate! It loads the entire cube to RAM.
-        ## cut = srcv[full_slice]
-
-        if src.ndim == 4:
-            cut = src[
-                :,
-                coords_lo[0]:coords_hi[0],
-                coords_lo[1]:coords_hi[1],
-                coords_lo[2]:coords_hi[2]
-            ]
-        elif src.ndim == 3:
-            cut = src[
-                coords_lo[0]:coords_hi[0],
-                coords_lo[1]:coords_hi[1],
-                coords_lo[2]:coords_hi[2]
-            ]
-        else:
-            raise ValueError(f'Expected src.ndim to be 3 or 4, but got {src.ndim} instead.')
-    # Work around mysterious random HDF5 read errors by recursively calling
-    #  this function from within itself until it works again or until
-    #  max_retries is exceeded.
-    except OSError:
-        traceback.print_exc()
-        logger.warning(
-            f'Read error. Retrying at the same location ({max_retries} attempts remaining)...'
-        )
-        # Try slicing from the same coordinates, but with max_retries -= 1.
-        #  (Overriding prepend_empty_axis to False because the initial (outer)
-        #  call will prepend the axis and propagating it to the recursive
-        #  (inner) calls could lead to multiple axes being prepended.)
-        cut = slice_h5(
-            src=src,
-            coords_lo=coords_lo,
-            coords_hi=coords_hi,
-            dtype=dtype,
-            prepend_empty_axis=False,  # See comment above
-            max_retries=(max_retries - 1)
-        )
-        # If the recursive call above was sucessful, use its result `cut`
-        # as if it was the immediate result of the first slice attempt.
-    if prepend_empty_axis:
-        cut = cut[None]
-    if cut.dtype != dtype:
-        cut = cut.astype(dtype)
-    return cut
-
-
-def save_to_h5(data, path, hdf5_names=None, overwrite=False, compression=True):
-    """
-    Saves data to HDF5 File.
-
-    Parameters
-    ----------
-    data: list or dict of np.arrays
-        if list, hdf5_names has to be set.
-    path: str
-        forward-slash separated path to file
-    hdf5_names: list of str
-        has to be the same length as data
-    overwrite : bool
-        determines whether existing files are overwritten
-    compression : bool
-        True: compression='gzip' is used which is recommended for sparse and
-        ordered data
-
-    Returns
-    -------
-    nothing
-
-    """
-    if (not type(data) is dict) and hdf5_names is None:
-        raise Exception("hdf5names has to be set if data is a list")
-    if os.path.isfile(path) and overwrite:
-        os.remove(path)
-    f = h5py.File(path, "w")
-    if type(data) is dict:
-        for key in data.keys():
-            if compression:
-                f.create_dataset(key, data=data[key], compression="gzip")
-            else:
-                f.create_dataset(key, data=data[key])
-    else:
-        if len(hdf5_names) != len(data):
-            f.close()
-            raise Exception("Not enough or to much hdf5-names given!")
-        for nb_data in range(len(data)):
-            if compression:
-                f.create_dataset(hdf5_names[nb_data], data=data[nb_data],
-                                 compression="gzip")
-            else:
-                f.create_dataset(hdf5_names[nb_data], data=data[nb_data])
-    f.close()
-
-
-def as_floatX(x):
-    if not hasattr(x, '__len__'):
-        return np.array(x, dtype=floatX)
-    return np.ascontiguousarray(x, dtype=floatX)
-
-
-def squash01(img: np.ndarray) -> np.ndarray:
-    """Squash image array to the value range [0, 1] (no clipping).
-
-    This can be used to prepare network outputs or normalized inputs
-    for plotting and generic image processing functions.
-    """
-    img = img.astype(np.float32)
-    squashed = (img - np.min(img)) / np.ptp(img)
-    return squashed
-
-
-# https://gist.github.com/tcwalther/ae058c64d5d9078a9f333913718bba95
-# class based on: http://stackoverflow.com/a/21919644/487556
-class DelayedInterrupt:
-    def __init__(self, signals):
-        if not isinstance(signals, list) and not isinstance(signals, tuple):
-            signals = [signals]
-        self.sigs = signals
-
-    def __enter__(self):
-        self.signal_received = {}
-        self.old_handlers = {}
-        for sig in self.sigs:
-            self.signal_received[sig] = False
-            self.old_handlers[sig] = signal.getsignal(sig)
-            def handler(s, frame):
-                logger.warning('Signal %s received. Delaying KeyboardInterrupt.' % sig)
-                self.signal_received[sig] = (s, frame)
-                # Note: in Python 3.5, you can use signal.Signals(sig).name
-            self.old_handlers[sig] = signal.getsignal(sig)
-            signal.signal(sig, handler)
-
-    def __exit__(self, type, value, traceback):
-        for sig in self.sigs:
-            signal.signal(sig, self.old_handlers[sig])
-            if self.signal_received[sig] and self.old_handlers[sig]:
-                self.old_handlers[sig](*self.signal_received[sig])
-
-
-class CleanExit:
-    # https://stackoverflow.com/questions/4205317/capture-keyboardinterrupt-in-python-without-try-except
-    def __enter__(self):
-        return self
-
-    def __exit__(self, exc_type, exc_value, exc_tb):
-        if exc_type is KeyboardInterrupt:
-            logger.warning('Delaying KeyboardInterrupt.')
-            return True
-        return exc_type is None
-
-
-class GracefulInterrupt:
-    # by https://stackoverflow.com/questions/18499497/how-to-process-sigterm-signal-gracefully
-    now = False
-
-    def __init__(self):
-        signal.signal(signal.SIGINT, self.exit_gracefully)
-        signal.signal(signal.SIGTERM, self.exit_gracefully)
-
-    def exit_gracefully(self, sig, frame):
-        logger.warning('Signal %s received. Delaying KeyboardInterrupt.' % sig)
-        self.now = True
-
-
-###########################################################
 def make_seed(shape, pad=0.05, seed=0.95):
+    """创建种子"""
     seed_array = np.full(list(shape), pad, dtype=np.float32)
     idx = tuple([slice(None)] + list(np.array(shape) // 2))
     seed_array[idx] = seed
     return seed_array
 
 
-def fixed_offsets(seed, fov_moves, threshold):
-    """Generates offsets based on a fixed list."""
+def fixed_offsets(seed, fov_moves, threshold=0.9):
+    """offset偏移."""
     for off in itertools.chain([(0, 0, 0)], fov_moves):
         is_valid_move = seed[0,
                             seed.shape[1] // 2 + off[2],
@@ -368,11 +48,678 @@ def fixed_offsets(seed, fov_moves, threshold):
         yield off
 
 
-def update_seed(updated, seed, model, offsets):
-    for idx, offset in enumerate(offsets):
-        start = offset + model.radii - model.input_size // 2
-        end = start + model.input_size
+def center_crop_and_pad(data, coor, target_shape):
+    """根据中心坐标 crop patch"""
+    target_shape = np.array(target_shape)
+
+    start = coor - target_shape // 2
+    end = start + target_shape
+
+    assert np.all(start >= 0)
+
+    selector = [slice(s, e) for s, e in zip(start, end)]
+    cropped = data[tuple(selector)]
+
+    if target_shape is not None:
+        target_shape = np.array(target_shape)
+        delta = target_shape - cropped.shape
+        pre = delta // 2
+        post = delta - delta // 2
+
+        paddings = []  # no padding for batch
+        paddings.extend(zip(pre, post))
+
+        cropped = np.pad(cropped, paddings, mode='constant')
+
+    return cropped
+
+
+def crop_and_pad(data, offset, crop_shape, target_shape=None):
+    """根据offset crop patch"""
+    # Spatial dimensions only. All vars in zyx.
+    shape = np.array(data.shape[1:])
+    crop_shape = np.array(crop_shape)
+    offset = np.array(offset[::-1])
+
+    start = shape // 2 - crop_shape // 2 + offset
+    end = start + crop_shape
+
+    assert np.all(start >= 0)
+
+    selector = [slice(s, e) for s, e in zip(start, end)]
+    selector = tuple([slice(None)] + selector)
+    cropped = data[selector]
+
+    if target_shape is not None:
+        target_shape = np.array(target_shape)
+        delta = target_shape - crop_shape
+        pre = delta // 2
+        post = delta - delta // 2
+
+        paddings = [(0, 0)]  # no padding for batch
+        paddings.extend(zip(pre, post))
+        paddings.append((0, 0))  # no padding for channels
+
+        cropped = np.pad(cropped, paddings, mode='constant')
+
+    return cropped
+
+
+def get_example(loader, shape, get_offsets):
+
+    while True:
+        for iter, (image, targets, seed, coor) in enumerate(loader):
+            for off in get_offsets(seed):
+                predicted = crop_and_pad(seed, off, shape).unsqueeze(0)
+                patches = crop_and_pad(image, off, shape).unsqueeze(0)
+                labels = crop_and_pad(targets, off, shape).unsqueeze(0)
+                offset = off
+
+                yield predicted, patches, labels, offset
+
+
+def get_batch(loader, batch_size, shape, get_offsets):
+    def _batch(iterable):
+        for batch_vals in iterable:
+          yield zip(*batch_vals)
+
+    for seeds, patches, labels, offsets in _batch(six.moves.zip(
+        *[get_example(loader, shape, get_offsets) for _
+            in range(batch_size)])):
+
+        yield torch.cat(seeds, dim=0).float(), torch.cat(patches, dim=0).float(), \
+              torch.cat(labels, dim=0).float(), offsets
+
+
+def update_seed(updated, seed, model, pos):
+    start = pos - model.input_size // 2
+    end = start + model.input_size
+    assert np.all(start >= 0)
+
+    selector = [slice(s, e) for s, e in zip(start, end)]
+    seed[selector] = np.squeeze(updated)
+
+
+def no_halt(verbosity=HALT_SILENT, log_function=logging.info):
+    """Dummy HaltInfo."""
+    def _halt_signaler(*unused_args, **unused_kwargs):
+        return False
+
+    def _halt_signaler_verbose(fetches, pos, **unused_kwargs):
+        log_function('%s, %s' % (pos, fetches))
+        return False
+
+    if verbosity == HALT_VERBOSE:
+        return HaltInfo(_halt_signaler_verbose, [])
+    else:
+        return HaltInfo(_halt_signaler, [])
+
+
+def self_prediction_halt(
+        threshold, orig_threshold=None, verbosity=HALT_SILENT,
+        log_function=logging.info):
+    """HaltInfo based on FFN self-predictions."""
+
+    def _halt_signaler(fetches, pos, orig_pos, counters, **unused_kwargs):
+        """Returns true if FFN prediction should be halted."""
+        if pos == orig_pos and orig_threshold is not None:
+            t = orig_threshold
+        else:
+            t = threshold
+
+        # [0] is by convention the total incorrect proportion prediction.
+        halt = fetches['self_prediction'][0] > t
+
+        if halt:
+            counters['halts'].Increment()
+
+        if verbosity == HALT_VERBOSE or (
+                halt and verbosity == PRINT_HALTS):
+            log_function('%s, %s' % (pos, fetches))
+
+        return halt
+
+    # Add self_prediction to the extra_fetches.
+    return HaltInfo(_halt_signaler, ['self_prediction'])
+
+
+class BaseSeedPolicy(object):
+    """Base class for seed policies."""
+
+    def __init__(self, canvas, **kwargs):
+        """Initializes the policy.
+        Args:
+          canvas: inference Canvas object; simple policies use this to access
+              basic geometry information such as the shape of the subvolume;
+              more complex policies can access the raw image data, etc.
+          **kwargs: other keyword arguments
+        """
+        del kwargs
+        # TODO(mjanusz): Remove circular reference between Canvas and seed policies.
+        self.canvas = weakref.proxy(canvas)
+        self.coords = None
+        self.idx = 0
+
+        self._init_coords()
+
+    def _init_coords(self):
+        raise NotImplementedError()
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        """Returns the next seed point as (z, y, x).
+        Does initial filtering of seed points to exclude locations that are
+        too close to the image border.
+        Returns:
+          (z, y, x) tuples.
+        Raises:
+          StopIteration when the seeds are exhausted.
+        """
+        if self.coords is None:
+            self._init_coords()
+
+        while self.idx < self.coords.shape[0]:
+            curr = self.coords[self.idx, :]
+            self.idx += 1
+
+            # TODO(mjanusz): Get rid of this.
+            # Do early filtering of clearly invalid locations (too close to image
+            # borders) as late filtering might be expensive.
+            if (np.all(curr - self.canvas.margin >= 0) and
+                np.all(curr + self.canvas.margin < self.canvas.shape)):
+                yield tuple(curr)  # z, y, x
+
+        raise StopIteration()
+
+    def next(self):
+        return self.__next__()
+
+    def get_state(self):
+        return self.coords, self.idx
+
+    def set_state(self, state):
+        self.coords, self.idx = state
+
+
+def quantize_probability(prob):
+    """Quantizes a probability map into a byte array."""
+    ret = np.digitize(prob, np.linspace(0.0, 1.0, 255))
+
+    # Digitize never uses the 0-th bucket.
+    ret[np.isnan(prob)] = 0
+    return ret.astype(np.uint8)
+
+
+def get_scored_move_offsets(deltas, prob_map, threshold=0.9):
+    """Looks for potential moves for a FFN.
+    The possible moves are determined by extracting probability map values
+    corresponding to cuboid faces at +/- deltas, and considering the highest
+    probability value for every face.
+    Args:
+      deltas: (z,y,x) tuple of base move offsets for the 3 axes
+      prob_map: current probability map as a (z,y,x) numpy array
+      threshold: minimum score required at the new FoV center for a move to be
+          considered valid
+    Yields:
+      tuples of:
+        score (probability at the new FoV center),
+        position offset tuple (z,y,x) relative to center of prob_map
+      The order of the returned tuples is arbitrary and should not be depended
+      upon. In particular, the tuples are not necessarily sorted by score.
+    """
+    center = np.array(prob_map.shape) // 2
+    assert center.size == 3
+    # Selects a working subvolume no more than +/- delta away from the current
+    # center point.
+    subvol_sel = [slice(c - dx, c + dx + 1) for c, dx
+                  in zip(center, deltas)]
+
+    done = set()
+    for axis, axis_delta in enumerate(deltas):
+        if axis_delta == 0:
+            continue
+        for axis_offset in (-axis_delta, axis_delta):
+            # Move exactly by the delta along the current axis, and select the face
+            # of the subvolume orthogonal to the current axis.
+            face_sel = subvol_sel[:]
+            face_sel[axis] = axis_offset + center[axis]
+            face_prob = prob_map[tuple(face_sel)]
+            shape = face_prob.shape
+
+            # Find voxel with maximum activation.
+            face_pos = np.unravel_index(face_prob.argmax(), shape)
+            score = face_prob[face_pos]
+
+            # Only move if activation crosses threshold.
+            if score < threshold:
+                continue
+
+            # Convert within-face position to be relative vs the center of the face.
+            relative_pos = [face_pos[0] - shape[0] // 2, face_pos[1] - shape[1] // 2]
+            relative_pos.insert(axis, axis_offset)
+            ret = (score, tuple(relative_pos))
+
+            if ret not in done:
+                done.add(ret)
+                yield ret
+
+
+class PolicyPeaks(BaseSeedPolicy):
+    """Attempts to find points away from edges in the image.
+    Runs a 3d Sobel filter to detect edges in the raw data, followed
+    by a distance transform and peak finding to identify seed points.
+    """
+
+    def _init_coords(self):
+        logging.info('peaks: starting')
+
+        # Edge detection.
+        edges = ndimage.generic_gradient_magnitude(
+            self.canvas.images.astype(np.float32),
+            ndimage.sobel)
+
+        # Adaptive thresholding.
+        sigma = 49.0 / 6.0
+        thresh_image = np.zeros(edges.shape, dtype=np.float32)
+        ndimage.gaussian_filter(edges, sigma, output=thresh_image, mode='reflect')
+        filt_edges = edges > thresh_image
+
+        del edges, thresh_image
+
+        # # This prevents a border effect where the large amount of masked area
+        # # screws up the distance transform below.
+        # if (self.canvas.restrictor is not None and
+        #         self.canvas.restrictor.mask is not None):
+        #     filt_edges[self.canvas.restrictor.mask] = 1
+
+        logging.info('peaks: filtering done')
+        dt = ndimage.distance_transform_edt(1 - filt_edges).astype(np.float32)
+        logging.info('peaks: edt done')
+
+        # Use a specifc seed for the noise so that results are reproducible
+        # regardless of what happens before the policy is called.
+        state = np.random.get_state()
+        np.random.seed(42)
+        idxs = skimage.feature.peak_local_max(
+            dt + np.random.random(dt.shape) * 1e-4,
+            indices=True, min_distance=3, threshold_abs=0, threshold_rel=0)
+        np.random.set_state(state)
+
+        # After skimage upgrade to 0.13.0 peak_local_max returns peaks in
+        # descending order, versus ascending order previously.  Sort ascending to
+        # maintain historic behavior.
+        idxs = np.array(sorted((z, y, x) for z, y, x in idxs))
+
+        logging.info('peaks: found %d local maxima', idxs.shape[0])
+        self.coords = idxs
+
+
+class BaseMovementPolicy(object):
+    """Base class for movement policy queues.
+    The principal usage is to initialize once with the policy's parameters and
+    set up a queue for candidate positions. From this queue candidates can be
+    iteratively consumed and the scores should be updated in the FFN
+    segmentation loop.
+    """
+
+    def __init__(self, canvas, scored_coords, deltas):
+        """Initializes the policy.
+        Args:
+          canvas: Canvas object for FFN inference
+          scored_coords: mutable container of tuples (score, zyx coord)
+          deltas: step sizes as (z,y,x)
+        """
+        # TODO(mjanusz): Remove circular reference between Canvas and seed policies.
+        self.canvas = weakref.proxy(canvas)
+        self.scored_coords = scored_coords
+        self.deltas = np.array(deltas)
+
+    def __len__(self):
+        return len(self.scored_coords)
+
+    def __iter__(self):
+        return self
+
+    def next(self):
+        raise StopIteration()
+
+    def append(self, item):
+        self.scored_coords.append(item)
+
+    def update(self, prob_map, position):
+        """Updates the state after an FFN inference call.
+        Args:
+          prob_map: object probability map returned by the FFN (in logit space)
+          position: postiion of the center of the FoV where inference was performed
+              (z, y, x)
+        """
+        raise NotImplementedError()
+
+    def get_state(self):
+        """Returns the state of this policy as a pickable Python object."""
+        raise NotImplementedError()
+
+    def restore_state(self, state):
+        raise NotImplementedError()
+
+    def reset_state(self, start_pos):
+        """Resets the policy.
+        Args:
+          start_pos: starting position of the current object as z, y, x
+        """
+        raise NotImplementedError()
+
+
+class FaceMaxMovementPolicy(BaseMovementPolicy):
+    """Selects candidates from maxima on prediction cuboid faces."""
+
+    def __init__(self, canvas, deltas=(4, 8, 8), score_threshold=0.9):
+        self.done_rounded_coords = set()
+        self.score_threshold = score_threshold
+        self._start_pos = None
+        super(FaceMaxMovementPolicy, self).__init__(canvas, deque([]), deltas)
+
+    def reset_state(self, start_pos):
+        self.scored_coords = deque([])
+        self.done_rounded_coords = set()
+        self._start_pos = start_pos
+
+    def get_state(self):
+        return [(self.scored_coords, self.done_rounded_coords)]
+
+    def restore_state(self, state):
+        self.scored_coords, self.done_rounded_coords = state[0]
+
+    def __next__(self):
+        """Pops positions from queue until a valid one is found and returns it."""
+        while self.scored_coords:
+            _, coord = self.scored_coords.popleft()
+            coord = tuple(coord)
+            if self.quantize_pos(coord) in self.done_rounded_coords:
+                continue
+            if self.canvas.is_valid_pos(coord):
+                break
+        else:  # Else goes with while, not with if!
+            raise StopIteration()
+
+        return tuple(coord)
+
+    def next(self):
+        return self.__next__()
+
+    def quantize_pos(self, pos):
+        """Quantizes the positions symmetrically to a grid downsampled by deltas."""
+        # Compute offset relative to the origin of the current segment and
+        # shift by half delta size. This ensures that all directions are treated
+        # approximately symmetrically -- i.e. the origin point lies in the middle of
+        # a cell of the quantized lattice, as opposed to a corner of that cell.
+        rel_pos = (np.array(pos) - self._start_pos)
+        coord = (rel_pos + self.deltas // 2) // np.maximum(self.deltas, 1)
+        return tuple(coord)
+
+    def update(self, prob_map, position):
+        """Adds movements to queue for the cuboid face maxima of ``prob_map``."""
+        qpos = self.quantize_pos(position)
+        self.done_rounded_coords.add(qpos)
+
+        scored_coords = get_scored_move_offsets(self.deltas, prob_map,
+                                                threshold=self.score_threshold)
+        scored_coords = sorted(scored_coords, reverse=True)
+        for score, rel_coord in scored_coords:
+              # convert to whole cube coordinates
+              coord = [rel_coord[i] + position[i] for i in range(3)]
+              self.scored_coords.append((score, coord))
+
+
+class Canvas(object):
+
+    def __init__(self, model, images, size, delta, seg_thr, mov_thr, act_thr):
+        self.model = model
+        self.images = images
+        self.shape = images.shape
+        self.input_size = np.array(size)
+        self.margin = np.array(size) // 2
+        self.seg_thr = logit(seg_thr)
+        self.mov_thr = logit(mov_thr)
+        self.act_thr = logit(act_thr)
+
+        self.segmentation = np.zeros(images.shape, dtype=np.int32)
+        self.seed = np.zeros(images.shape, dtype=np.float32)
+        self.seg_prob = np.zeros(images.shape, dtype=np.uint8)
+
+        self.seed_policy = None
+        self.max_id = 0
+        # Maps of segment id -> ..
+        self.origins = {}  # seed location
+        self.overlaps = {}  # (ids, number overlapping voxels)
+
+        self.movement_policy = FaceMaxMovementPolicy(self, deltas=delta, score_threshold=self.mov_thr)
+
+        self.reset_state((0, 0, 0))
+
+    def init_seed(self, pos):
+        """Reinitiailizes the object mask with a seed.
+        Args:
+          pos: position at which to place the seed (z, y, x)
+        """
+        self.seed[...] = np.nan
+        self.seed[pos] = self.act_thr
+
+    def reset_state(self, start_pos):
+        # Resetting the movement_policy is currently necessary to update the
+        # policy's bitmask for whether a position is already segmented (the
+        # canvas updates the segmented mask only between calls to segment_at
+        # and therefore the policy does not update this mask for every call.).
+        self.movement_policy.reset_state(start_pos)
+        self.history = []
+        self.history_deleted = []
+
+        self._min_pos = np.array(start_pos)
+        self._max_pos = np.array(start_pos)
+
+    def is_valid_pos(self, pos, ignore_move_threshold=False):
+        """Returns True if segmentation should be attempted at the given position.
+        Args:
+          pos: position to check as (z, y, x)
+          ignore_move_threshold: (boolean) when starting a new segment at pos the
+              move threshold can and must be ignored.
+        Returns:
+          Boolean indicating whether to run FFN inference at the given position.
+        """
+
+        if not ignore_move_threshold:
+            if self.seed[pos] < self.mov_thr:
+                return False
+
+        # Not enough image context?
+        np_pos = np.array(pos)
+        low = np_pos - self.margin
+        high = np_pos + self.margin
+
+        if np.any(low < 0) or np.any(high >= self.shape):
+            return False
+
+        # Location already segmented?
+        if self.segmentation[pos] > 0:
+            return False
+
+        return True
+
+    def predict(self, pos):
+        """Runs a single step of FFN prediction.
+        """
+        # Top-left corner of the FoV.
+        start = np.array(pos) - self.margin
+        end = start + self.input_size
+
         assert np.all(start >= 0)
 
-        selector = [slice(s, e) for s, e in zip(start, end)]
-        seed[0][selector] = torch.squeeze(updated[idx]).detach().cpu()
+        # selector = [slice(s, e) for s, e in zip(start, end)]
+        images = self.images[start[0]:end[0], start[1]:end[1], start[2]:end[2]]
+        seeds = self.seed[start[0]:end[0], start[1]:end[1], start[2]:end[2]].copy()
+        init_prediction = np.isnan(seeds)
+        seeds[init_prediction] = np.float32(logit(0.05))
+        images = torch.from_numpy(images).float().unsqueeze(0).unsqueeze(0)
+        seeds = torch.from_numpy(seeds).float().unsqueeze(0).unsqueeze(0)
+
+        slice = seeds[:, :, seeds.shape[2] // 2, :, :].sigmoid()
+        seeds[:, :, seeds.shape[2] // 2, :, :] = slice
+
+        input_data = torch.cat([images, seeds], dim=1)
+        input_data = Variable(input_data.cuda())
+
+        logits = self.model(input_data)
+        updated = (seeds.cuda() + logits).detach().cpu().numpy()
+        # update_seed(updated, self.seed, self.model, pos)
+
+        prob = expit(updated)
+        return np.squeeze(prob), np.squeeze(updated)
+
+    def update_at(self, pos):
+        """Updates object mask prediction at a specific position.
+        """
+        global old_err
+        off = self.input_size // 2  # zyx
+
+        start = np.array(pos) - off
+        end = start + self.input_size
+        sel = [slice(s, e) for s, e in zip(start, end)]
+        logit_seed = np.array(self.seed[tuple(sel)])
+        init_prediction = np.isnan(logit_seed)
+        logit_seed[init_prediction] = np.float32(logit(0.05))
+
+        prob_seed = expit(logit_seed)
+        for _ in range(MAX_SELF_CONSISTENT_ITERS):
+            prob, logits = self.predict(pos)
+            break
+
+            # diff = np.average(np.abs(prob_seed - prob))
+            # if diff < self.options.consistency_threshold:
+            #     break
+
+            # prob_seed, logit_seed = prob, logits
+
+        # if self.halt_signaler.is_halt(fetches=fetches, pos=pos,
+        #                               orig_pos=start_pos,
+        #                               counters=self.counters):
+        #     logits[:] = np.float32(self.options.pad_value)
+
+        sel = [slice(s, e) for s, e in zip(start, end)]
+
+        # Bias towards oversegmentation by making it impossible to reverse
+        # disconnectedness predictions in the course of inference.
+        th_max = logit(0.5)
+        old_seed = self.seed[tuple(sel)]
+
+        if np.mean(logits >= self.mov_thr) > 0:
+            # Because (x > NaN) is always False, this mask excludes positions that
+            # were previously uninitialized (i.e. set to NaN in old_seed).
+            try:
+                old_err = np.seterr(invalid='ignore')
+                mask = ((old_seed < th_max) & (logits > old_seed))
+            finally:
+                np.seterr(**old_err)
+            logits[mask] = old_seed[mask]
+
+        # Update working space.
+        self.seed[tuple(sel)] = logits
+
+        return logits
+
+    def segment_at(self, start_pos):
+        self.init_seed(start_pos)
+        num_iters = 0
+        self.reset_state(start_pos)
+
+        if not self.movement_policy:
+            # Add first element with arbitrary priority 1 (it will be consumed
+            # right away anyway).
+            item = (self.movement_policy.score_threshold * 2, start_pos)
+            self.movement_policy.append(item)
+        for pos in self.movement_policy:
+            # Terminate early if the seed got too weak.
+            # print(len(self.movement_policy.scored_coords))
+            if self.seed[start_pos] < self.mov_thr:
+                  break
+
+            # if not self.restrictor.is_valid_pos(pos):
+            #     continue
+
+            pred = self.update_at(pos)
+            self._min_pos = np.minimum(self._min_pos, pos)
+            self._max_pos = np.maximum(self._max_pos, pos)
+            num_iters += 1
+
+            self.movement_policy.update(pred, pos)
+
+            assert np.all(pred.shape == self.input_size)
+
+        return num_iters
+
+    def segment_all(self):
+        self.seed_policy = PolicyPeaks(self)
+        mbd = np.array([1, 1, 1])
+        iter = 0
+        try:
+            for pos in next(self.seed_policy):
+
+                count = round(1.0 * iter / len(self.seed_policy.coords) * 50)
+
+                if iter == 246:
+                    print('done')
+
+                sys.stdout.write('[ {}/{}: [{}{}]\r'.format(iter + 1, len(self.seed_policy.coords),
+                                                            '#' * count, ' ' * (50 - count)))
+                iter += 1
+
+                if not self.is_valid_pos(pos, ignore_move_threshold=True):
+                  continue
+
+                low = np.array(pos) - mbd
+                high = np.array(pos) + mbd + 1
+                sel = [slice(s, e) for s, e in zip(low, high)]
+                if np.any(self.segmentation[tuple(sel)] > 0):
+                    self.segmentation[pos] = -1
+                    continue
+
+                seg_start = time.time()
+                num_iters = self.segment_at(pos)
+                t_seg = time.time() - seg_start
+
+                if num_iters <= 0:
+                    continue
+
+                if self.seed[pos] < self.mov_thr:
+                    # Mark this location as excluded.
+                    if self.segmentation[pos] == 0:
+                        self.segmentation[pos] = -1
+                    continue
+
+                sel = [slice(max(s, 0), e + 1) for s, e in zip(self._min_pos - self.input_size // 2, self._max_pos + self.input_size // 2)]
+                mask = self.seed[tuple(sel)] >= self.seg_thr
+                raw_segmented_voxels = np.sum(mask)
+                overlapped_ids, counts = np.unique(self.segmentation[tuple(sel)][mask], return_counts=True)
+                valid = overlapped_ids > 0
+                overlapped_ids = overlapped_ids[valid]
+                counts = counts[valid]
+                mask &= self.segmentation[tuple(sel)] <= 0
+                actual_segmented_voxels = np.sum(mask)
+                if actual_segmented_voxels < 1000:
+                    if self.segmentation[pos] == 0:
+                        self.segmentation[pos] = -1
+                    continue
+
+                self.max_id += 1
+                while self.max_id in self.origins:
+                    self.max_id += 1
+
+                self.segmentation[tuple(sel)][mask] = self.max_id
+                self.seg_prob[tuple(sel)][mask] = quantize_probability(expit(self.seed[tuple(sel)][mask]))
+                self.overlaps[self.max_id] = np.array([overlapped_ids, counts])
+                self.origins[self.max_id] = OriginInfo(pos, num_iters, t_seg)
+
+        except RuntimeError:
+            return True
+        
