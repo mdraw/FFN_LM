@@ -9,11 +9,13 @@ class ResBlock(nn.Module):
     def __init__(self, in_channels=32, mid_channels=32, kernel_size=(3, 3, 3), padding=1):
         super(ResBlock, self).__init__()
         self.conv0 = nn.Conv3d(in_channels, mid_channels, kernel_size, padding=padding)
+        self.bn3d = nn.BatchNorm3d(mid_channels)
         self.conv1 = nn.Conv3d(in_channels, mid_channels, kernel_size, padding=padding)
 
     def forward(self, x):
         conv0_out = self.conv0(F.relu(x))
-        conv1_out = self.conv1(F.relu(conv0_out))
+        BNout = self.bn3d(conv0_out)
+        conv1_out = self.conv1(F.relu(BNout))
 
         return conv1_out + x
 
