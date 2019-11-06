@@ -14,7 +14,9 @@ from collections import namedtuple
 from collections import deque
 import time
 from torch.autograd import Variable
-
+import executor
+import cv2
+from functools import reduce
 
 MAX_SELF_CONSISTENT_ITERS = 32
 HALT_SILENT = 0
@@ -25,8 +27,12 @@ OriginInfo = namedtuple('OriginInfo', ['start_zyx', 'iters', 'walltime_sec'])
 HaltInfo = namedtuple('HaltInfo', ['is_halt', 'extra_fetches'])
 
 
+def sigmoid(x):
+    return 1 / (1 + np.exp(-x))
+
+
 def make_seed(shape, pad=0.05, seed=0.95):
-    
+    """创建种子"""
     seed_array = np.full(list(shape), pad, dtype=np.float32)
     idx = tuple([slice(None)] + list(np.array(shape) // 2))
     seed_array[idx] = seed
@@ -34,7 +40,7 @@ def make_seed(shape, pad=0.05, seed=0.95):
 
 
 def fixed_offsets(seed, fov_moves, threshold=0.9):
-    """offset_coord_sequence."""
+    """offset偏移."""
     for off in itertools.chain([(0, 0, 0)], fov_moves):
         is_valid_move = seed[0,
                             seed.shape[1] // 2 + off[2],
@@ -49,33 +55,44 @@ def fixed_offsets(seed, fov_moves, threshold=0.9):
 
 
 def center_crop_and_pad(data, coor, target_shape):
-    """use center coord to crop patch"""
+    """根据中心坐标 crop patch"""
     target_shape = np.array(target_shape)
 
     start = coor - target_shape // 2
     end = start + target_shape
-
+    #print(start)
     assert np.all(start >= 0)
 
     selector = [slice(s, e) for s, e in zip(start, end)]
     cropped = data[tuple(selector)]
 
     if target_shape is not None:
-        target_shape = np.array(target_shape)
-        delta = target_shape - cropped.shape
-        pre = delta // 2
-        post = delta - delta // 2
 
-        paddings = []  # no padding for batch
-        paddings.extend(zip(pre, post))
+        if len(cropped.shape) > 3:
+            target_shape = np.array(target_shape)
+            delta = target_shape - cropped.shape[:-1]
+            pre = delta // 2
+            post = delta - delta // 2
 
-        cropped = np.pad(cropped, paddings, mode='constant')
+            paddings = []  # no padding for batch
+            paddings.extend(zip(pre, post))
+            paddings.append((0, 0))
+            cropped = np.pad(cropped, paddings, mode='constant')
+        else:
+            target_shape = np.array(target_shape)
+            delta = target_shape - cropped.shape
+            pre = delta // 2
+            post = delta - delta // 2
+
+            paddings = []  # no padding for batch
+            paddings.extend(zip(pre, post))
+            cropped = np.pad(cropped, paddings, mode='constant')
 
     return cropped
 
 
 def crop_and_pad(data, offset, crop_shape, target_shape=None):
-    """use offset to crop patch"""
+    """根据offset crop patch"""
     # Spatial dimensions only. All vars in zyx.
     shape = np.array(data.shape[1:])
     crop_shape = np.array(crop_shape)
@@ -106,16 +123,16 @@ def crop_and_pad(data, offset, crop_shape, target_shape=None):
 
 
 def get_example(loader, shape, get_offsets):
-
     while True:
-        for iter, (image, targets, seed, coor) in enumerate(loader):
-            for off in get_offsets(seed):
-                predicted = crop_and_pad(seed, off, shape).unsqueeze(0)
-                patches = crop_and_pad(image, off, shape).unsqueeze(0)
-                labels = crop_and_pad(targets, off, shape).unsqueeze(0)
-                offset = off
-
-                yield predicted, patches, labels, offset
+        iteration, (image, targets, seed, coor) = next(enumerate(loader))
+        seed = seed.numpy().copy()
+        for off in get_offsets(seed):
+            predicted = crop_and_pad(seed, off, shape)[np.newaxis, ...]
+            patches = crop_and_pad(image.squeeze(), off, shape).unsqueeze(0)
+            labels = crop_and_pad(targets, off, shape).unsqueeze(0)
+            offset = off
+            assert predicted.base is seed
+            yield predicted, patches, labels, offset
 
 
 def get_batch(loader, batch_size, shape, get_offsets):
@@ -127,8 +144,13 @@ def get_batch(loader, batch_size, shape, get_offsets):
         *[get_example(loader, shape, get_offsets) for _
             in range(batch_size)])):
 
-        yield torch.cat(seeds, dim=0).float(), torch.cat(patches, dim=0).float(), \
-              torch.cat(labels, dim=0).float(), offsets
+        batched_seeds = np.concatenate(seeds)
+
+        yield (batched_seeds, torch.cat(patches, dim=0).float(), \
+              torch.cat(labels, dim=0).float(), offsets)
+
+        for i in range(batch_size):
+          seeds[i][:] = batched_seeds[i, ...]
 
 
 def update_seed(updated, seed, model, pos):
@@ -188,6 +210,7 @@ class BaseSeedPolicy(object):
 
     def __init__(self, canvas, **kwargs):
         """Initializes the policy.
+
         Args:
           canvas: inference Canvas object; simple policies use this to access
               basic geometry information such as the shape of the subvolume;
@@ -210,10 +233,13 @@ class BaseSeedPolicy(object):
 
     def __next__(self):
         """Returns the next seed point as (z, y, x).
+
         Does initial filtering of seed points to exclude locations that are
         too close to the image border.
+
         Returns:
           (z, y, x) tuples.
+
         Raises:
           StopIteration when the seeds are exhausted.
         """
@@ -254,18 +280,22 @@ def quantize_probability(prob):
 
 def get_scored_move_offsets(deltas, prob_map, threshold=0.9):
     """Looks for potential moves for a FFN.
+
     The possible moves are determined by extracting probability map values
     corresponding to cuboid faces at +/- deltas, and considering the highest
     probability value for every face.
+
     Args:
       deltas: (z,y,x) tuple of base move offsets for the 3 axes
       prob_map: current probability map as a (z,y,x) numpy array
       threshold: minimum score required at the new FoV center for a move to be
           considered valid
+
     Yields:
       tuples of:
         score (probability at the new FoV center),
         position offset tuple (z,y,x) relative to center of prob_map
+
       The order of the returned tuples is arbitrary and should not be depended
       upon. In particular, the tuples are not necessarily sorted by score.
     """
@@ -308,6 +338,7 @@ def get_scored_move_offsets(deltas, prob_map, threshold=0.9):
 
 class PolicyPeaks(BaseSeedPolicy):
     """Attempts to find points away from edges in the image.
+
     Runs a 3d Sobel filter to detect edges in the raw data, followed
     by a distance transform and peak finding to identify seed points.
     """
@@ -316,8 +347,9 @@ class PolicyPeaks(BaseSeedPolicy):
         logging.info('peaks: starting')
 
         # Edge detection.
+        gray = np.array([cv2.cvtColor(im, cv2.COLOR_BGR2GRAY) for im in self.canvas.images])
         edges = ndimage.generic_gradient_magnitude(
-            self.canvas.images.astype(np.float32),
+            gray.astype(np.float32),
             ndimage.sobel)
 
         # Adaptive thresholding.
@@ -344,7 +376,7 @@ class PolicyPeaks(BaseSeedPolicy):
         np.random.seed(42)
         idxs = skimage.feature.peak_local_max(
             dt + np.random.random(dt.shape) * 1e-4,
-            indices=True, min_distance=3, threshold_abs=0, threshold_rel=0)
+            indices=True, min_distance=1, threshold_abs=0, threshold_rel=0)
         np.random.set_state(state)
 
         # After skimage upgrade to 0.13.0 peak_local_max returns peaks in
@@ -358,6 +390,7 @@ class PolicyPeaks(BaseSeedPolicy):
 
 class BaseMovementPolicy(object):
     """Base class for movement policy queues.
+
     The principal usage is to initialize once with the policy's parameters and
     set up a queue for candidate positions. From this queue candidates can be
     iteratively consumed and the scores should be updated in the FFN
@@ -366,6 +399,7 @@ class BaseMovementPolicy(object):
 
     def __init__(self, canvas, scored_coords, deltas):
         """Initializes the policy.
+
         Args:
           canvas: Canvas object for FFN inference
           scored_coords: mutable container of tuples (score, zyx coord)
@@ -390,6 +424,7 @@ class BaseMovementPolicy(object):
 
     def update(self, prob_map, position):
         """Updates the state after an FFN inference call.
+
         Args:
           prob_map: object probability map returned by the FFN (in logit space)
           position: postiion of the center of the FoV where inference was performed
@@ -406,6 +441,7 @@ class BaseMovementPolicy(object):
 
     def reset_state(self, start_pos):
         """Resets the policy.
+
         Args:
           start_pos: starting position of the current object as z, y, x
         """
@@ -475,19 +511,31 @@ class FaceMaxMovementPolicy(BaseMovementPolicy):
 
 class Canvas(object):
 
-    def __init__(self, model, images, size, delta, seg_thr, mov_thr, act_thr):
+    def __init__(self, model, images,swc_dict , swc_data, size, delta, seg_thr, mov_thr, act_thr):
         self.model = model
         self.images = images
-        self.shape = images.shape
+        self.shape = images.shape[:-1]
         self.input_size = np.array(size)
         self.margin = np.array(size) // 2
         self.seg_thr = logit(seg_thr)
         self.mov_thr = logit(mov_thr)
         self.act_thr = logit(act_thr)
 
-        self.segmentation = np.zeros(images.shape, dtype=np.int32)
-        self.seed = np.zeros(images.shape, dtype=np.float32)
-        self.seg_prob = np.zeros(images.shape, dtype=np.uint8)
+        self._exec_client_id = None
+        self.segmentation = np.zeros(self.shape, dtype=np.int32)
+        self.seed = np.zeros(self.shape, dtype=np.float32)
+        self.seg_prob = np.zeros(self.shape, dtype=np.uint8)
+
+        #swc = np.ones(self.shape, dtype=bool)
+
+
+
+        self.swc_dict = swc_dict
+        self.swc_mask = np.ones(self.shape, dtype=bool)
+        self.swc_data = swc_data
+
+
+        self.target_dic = {}
 
         self.seed_policy = None
         self.max_id = 0
@@ -497,10 +545,28 @@ class Canvas(object):
 
         self.movement_policy = FaceMaxMovementPolicy(self, deltas=delta, score_threshold=self.mov_thr)
 
+        exec_cls = executor.ThreadingBatchExecutor
+
+        self.executor = exec_cls(self.model, 1)
+        self.executor.start_server()
+
         self.reset_state((0, 0, 0))
+
+    def __del__(self):
+        self.stop_executor()
+
+    def stop_executor(self):
+        """Shuts down the executor.
+
+        No-op when no executor is active.
+        """
+        if self.executor is not None:
+            self.executor.stop_server()
+            self.executor = None
 
     def init_seed(self, pos):
         """Reinitiailizes the object mask with a seed.
+
         Args:
           pos: position at which to place the seed (z, y, x)
         """
@@ -518,13 +584,27 @@ class Canvas(object):
 
         self._min_pos = np.array(start_pos)
         self._max_pos = np.array(start_pos)
+        self._register_client()
+
+    def _register_client(self):
+        if self._exec_client_id is None:
+            self._exec_client_id = self.executor.start_client()
+            logging.info('Registered as client %d.', self._exec_client_id)
+
+    def _deregister_client(self):
+        if self._exec_client_id is not None:
+            logging.info('Deregistering client %d', self._exec_client_id)
+            self.executor.finish_client(self._exec_client_id)
+            self._exec_client_id = None
 
     def is_valid_pos(self, pos, ignore_move_threshold=False):
         """Returns True if segmentation should be attempted at the given position.
+
         Args:
           pos: position to check as (z, y, x)
           ignore_move_threshold: (boolean) when starting a new segment at pos the
               move threshold can and must be ignored.
+
         Returns:
           Boolean indicating whether to run FFN inference at the given position.
         """
@@ -547,6 +627,37 @@ class Canvas(object):
 
         return True
 
+
+    def huejug(self, swc_crop):
+
+        shape = swc_crop.shape
+        rad = int(shape[0])
+
+
+        hueFeature = 0
+        pixelNum = 0
+        for z in range(rad):
+            for y in range(rad):
+                for x in range(rad):
+                    hue = swc_crop[z,y,x]
+
+                    totalIntensity = hue[0] + hue[1] + hue[2]
+                    if totalIntensity <= 150:
+                        continue
+
+                    hueNorm = [0,0,0]
+                    for channel in range(3):
+                        hueNorm[channel] = float((hue[channel]) / totalIntensity)
+                    hueFeature += hueNorm[0]
+                    hueFeature += hueNorm[1]
+                    pixelNum += 1
+
+        huethr = float(hueFeature/pixelNum)
+        if huethr > 0.75:
+            return False
+        else:
+            return True
+
     def predict(self, pos):
         """Runs a single step of FFN prediction.
         """
@@ -557,24 +668,86 @@ class Canvas(object):
         assert np.all(start >= 0)
 
         # selector = [slice(s, e) for s, e in zip(start, end)]
-        images = self.images[start[0]:end[0], start[1]:end[1], start[2]:end[2]]
+        images = self.images[start[0]:end[0], start[1]:end[1], start[2]:end[2], :].transpose(3, 0, 1, 2)
         seeds = self.seed[start[0]:end[0], start[1]:end[1], start[2]:end[2]].copy()
         init_prediction = np.isnan(seeds)
         seeds[init_prediction] = np.float32(logit(0.05))
-        images = torch.from_numpy(images).float().unsqueeze(0).unsqueeze(0)
-        seeds = torch.from_numpy(seeds).float().unsqueeze(0).unsqueeze(0)
+        images = torch.from_numpy(images).float()
+        seeds = torch.from_numpy(seeds).float().unsqueeze(0)
 
-        slice = seeds[:, :, seeds.shape[2] // 2, :, :].sigmoid()
-        seeds[:, :, seeds.shape[2] // 2, :, :] = slice
+        #self.swc
 
-        input_data = torch.cat([images, seeds], dim=1)
-        input_data = Variable(input_data.cuda())
+        #slice = seeds[:, seeds.shape[2] // 2, :, :].sigmoid()
+        #seeds[:, seeds.shape[2] // 2, :, :] = slice
 
-        logits = self.model(input_data)
-        updated = (seeds.cuda() + logits).detach().cpu().numpy()
-        # update_seed(updated, self.seed, self.model, pos)
+
+
+
+        # input_data = torch.cat([images, seeds], dim=1)
+        # input_data = Variable(input_data.cuda())
+        #
+        # logits = self.model(input_data)
+        # updated = (seeds.cuda() + logits).detach().cpu().numpy()
+        updated = self.executor.predict(self._exec_client_id, seeds, images)
 
         prob = expit(updated)
+
+
+
+        
+
+        #swc_crop = self.swc_tif[start[0]:end[0], start[1]:end[1], start[2]:end[2]].copy()
+        #swc_dict
+        """
+        self.swc_dict = swc_dict
+        self.swc_mask = np.ones(self.shape, dtype=bool)
+        self.swc_data = swc_data
+        """
+
+        resultz = np.where((self.swc_data[:, 4]>=start[0]) & (self.swc_data[:, 4]<=end[0]))
+        resulty = np.where((self.swc_data[:, 3] >= start[1]) & (self.swc_data[:, 3] <= end[1]))
+        resultx = np.where((self.swc_data[:, 2] >= start[2]) & (self.swc_data[:, 2] <= end[2]))
+        from functools import reduce
+        swc_coords_in_fov = reduce(np.intersect1d, (resultz, resulty, resultx))
+
+        for point in  swc_coords_in_fov:
+            x = self.swc_data[:, 2][point]
+            y = self.swc_data[:, 3][point]
+            z = self.swc_data[:, 4][point]
+
+            coord = (int(z),int(y),int(x))
+            rad = self.swc_data[:, 5][point] + 9
+            rad = int(rad)
+
+            strx = str(x)
+            stry = str(y)
+            strz = str(z)
+
+            if (x <= 0) | (y <= 0) | (z <= 0) | (z >= (self.shape[0] - rad)) | (y >= (self.shape[1] - rad)) | (
+                    x >= (self.shape[2] - rad)):
+                continue
+
+            if rad % 2 == 1:
+                rad += 1
+            target_shape = (rad, rad, rad)
+            target_shape = np.array(target_shape)
+            coord = (int(z), int(y), int(x))
+            coord = np.array(coord)
+            start_swc = coord - target_shape // 2
+            end_swc = start + target_shape
+
+            selector = [slice(s, e) for s, e in zip(start, end)]
+            print(selector)
+            #bed[tuple(selector)]  = self.swc_data[:, 0][point]
+
+            swc_crop = self.images[ start_swc[0]:end_swc[0],  start_swc[1]:end_swc[1],  start_swc[2]:end_swc[2]].copy()
+            print(swc_crop.shape)
+
+            #self.swc_mask[tuple(selector)] = False
+
+
+
+
         return np.squeeze(prob), np.squeeze(updated)
 
     def update_at(self, pos):
@@ -592,20 +765,11 @@ class Canvas(object):
 
         prob_seed = expit(logit_seed)
         for _ in range(MAX_SELF_CONSISTENT_ITERS):
+            """网络inference"""
             prob, logits = self.predict(pos)
             break
 
-            # diff = np.average(np.abs(prob_seed - prob))
-            # if diff < self.options.consistency_threshold:
-            #     break
-
-            # prob_seed, logit_seed = prob, logits
-
-        # if self.halt_signaler.is_halt(fetches=fetches, pos=pos,
-        #                               orig_pos=start_pos,
-        #                               counters=self.counters):
-        #     logits[:] = np.float32(self.options.pad_value)
-
+        """更新seed"""
         sel = [slice(s, e) for s, e in zip(start, end)]
 
         # Bias towards oversegmentation by making it impossible to reverse
@@ -644,14 +808,13 @@ class Canvas(object):
             if self.seed[start_pos] < self.mov_thr:
                   break
 
-            # if not self.restrictor.is_valid_pos(pos):
-            #     continue
-
+            """根据移动后的坐标分割"""
             pred = self.update_at(pos)
             self._min_pos = np.minimum(self._min_pos, pos)
             self._max_pos = np.maximum(self._max_pos, pos)
             num_iters += 1
 
+            """更新移动策略"""
             self.movement_policy.update(pred, pos)
 
             assert np.all(pred.shape == self.input_size)
@@ -667,13 +830,11 @@ class Canvas(object):
 
                 count = round(1.0 * iter / len(self.seed_policy.coords) * 50)
 
-                if iter == 246:
-                    print('done')
-
                 sys.stdout.write('[ {}/{}: [{}{}]\r'.format(iter + 1, len(self.seed_policy.coords),
                                                             '#' * count, ' ' * (50 - count)))
                 iter += 1
 
+                """根据有效坐标计算slice"""
                 if not self.is_valid_pos(pos, ignore_move_threshold=True):
                   continue
 
@@ -685,6 +846,7 @@ class Canvas(object):
                     continue
 
                 seg_start = time.time()
+                """分割当前坐标cube"""
                 num_iters = self.segment_at(pos)
                 t_seg = time.time() - seg_start
 
@@ -697,6 +859,7 @@ class Canvas(object):
                         self.segmentation[pos] = -1
                     continue
 
+                """根据seed内容计算最后的分割图"""
                 sel = [slice(max(s, 0), e + 1) for s, e in zip(self._min_pos - self.input_size // 2, self._max_pos + self.input_size // 2)]
                 mask = self.seed[tuple(sel)] >= self.seg_thr
                 raw_segmented_voxels = np.sum(mask)
@@ -711,6 +874,7 @@ class Canvas(object):
                         self.segmentation[pos] = -1
                     continue
 
+                """每次不同目标通过id+1实现区分"""
                 self.max_id += 1
                 while self.max_id in self.origins:
                     self.max_id += 1
@@ -719,7 +883,11 @@ class Canvas(object):
                 self.seg_prob[tuple(sel)][mask] = quantize_probability(expit(self.seed[tuple(sel)][mask]))
                 self.overlaps[self.max_id] = np.array([overlapped_ids, counts])
                 self.origins[self.max_id] = OriginInfo(pos, num_iters, t_seg)
+                max_value = self.segmentation.max()
+                self.segmentation[self.segmentation == -1] = 0
+                self.segmentation = self.segmentation * (1.0 * 255 / max_value)
+                self.target_dic[self.max_id] = self.segmentation.astype(np.uint8)
+                self.segmentation = np.zeros(self.shape, dtype=np.int32)
 
         except RuntimeError:
             return True
-        
