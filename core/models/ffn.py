@@ -9,24 +9,26 @@ class ResBlock(nn.Module):
     def __init__(self, in_channels=32, mid_channels=32, kernel_size=(3, 3, 3), padding=1):
         super(ResBlock, self).__init__()
         self.conv0 = nn.Conv3d(in_channels, mid_channels, kernel_size, padding=padding)
-        self.bn3d = nn.BatchNorm3d(mid_channels)
+        self.bn0 = nn.BatchNorm3d(mid_channels)
         self.conv1 = nn.Conv3d(in_channels, mid_channels, kernel_size, padding=padding)
+        self.bn1 = nn.BatchNorm3d(mid_channels)
 
     def forward(self, x):
-        conv0_out = self.conv0(F.relu(x))
-        BNout = self.bn3d(conv0_out)
-        conv1_out = self.conv1(F.relu(BNout))
-
-        return conv1_out + x
+        conv0_out = F.relu(self.bn0(self.conv0(x)))
+        conv1_out = self.bn1(self.conv1(conv0_out))
+        res_out = F.relu(conv1_out + x)
+        return res_out
 
 
 class FFN(nn.Module):
     def __init__(self, in_channels=2, mid_channels=32, out_channels=1, kernel_size=(3, 3, 3), padding=1, depth=12,
-                 input_size=[33, 33, 33], delta=[8, 8, 8]):
+                 input_size=(33, 33, 33), delta=(8, 8, 8)):
         super(FFN, self).__init__()
 
         self.conv0 = nn.Conv3d(in_channels, mid_channels, kernel_size, padding=padding)
+        self.bn0 = nn.BatchNorm3d(mid_channels)
         self.conv1 = nn.Conv3d(mid_channels, mid_channels, kernel_size, padding=padding)
+        self.bn1 = nn.BatchNorm3d(mid_channels)
         self.resblocks = nn.Sequential(*[ResBlock(mid_channels, mid_channels, kernel_size, padding) for i in range(1, depth)])
         self.conv3 = nn.Conv3d(mid_channels, out_channels, (1, 1, 1))
 
@@ -37,12 +39,11 @@ class FFN(nn.Module):
         self._init_weights()
 
     def forward(self, x):
-        conv0_out = self.conv0(x)
-        conv1_out = self.conv1(F.relu(conv0_out))
+        conv0_out = F.relu(self.bn0(self.conv0(x)))
+        conv1_out = F.relu(self.bn1(self.conv1(conv0_out)))
         res_out = self.resblocks(conv1_out)
-        logits = self.conv3(F.relu(res_out))
-
-        return logits
+        out = self.conv3(res_out)
+        return out
 
     def _init_weights(self):
         for m in self.modules():
