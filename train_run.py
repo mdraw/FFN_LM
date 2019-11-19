@@ -7,7 +7,6 @@ from functools import partial
 import os
 import torch
 from torch import optim
-from torch.autograd import Variable
 import torch.nn.functional as F
 import numpy as np
 from core.models.ffn import FFN
@@ -51,6 +50,7 @@ def run():
     train_loader = DataLoader(train_dataset, shuffle=True, num_workers=0, pin_memory=True)
     optimizer = optim.Adam(model.parameters(), lr=args.lr)
     scheduler = torch.optim.lr_scheduler.StepLR(optimizer, args.step, gamma=args.gamma, last_epoch=-1)
+    criterion = torch.nn.CrossEntropyLoss()
     best_loss = np.inf
     """获取数据流"""
     t_last = time.time()
@@ -69,11 +69,11 @@ def run():
         labels = labels.cuda()
         torch_seed = torch.from_numpy(seeds)
         input_data = torch.cat([images, torch_seed], dim=1)
-        input_data = Variable(input_data.cuda())
-        logits = model(input_data)
-        updated = torch_seed.cuda() + logits
+        input_data = input_data.cuda()
+        out = model(input_data)
+        updated = torch_seed.cuda() + out
         optimizer.zero_grad()
-        loss = F.binary_cross_entropy_with_logits(updated, labels)#+, pos_weight= pos_w)
+        loss = criterion(updated, labels)
         loss.backward()
         """梯度截断"""
         torch.nn.utils.clip_grad_value_(model.parameters(), args.clip_grad_thr)
